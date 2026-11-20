@@ -24,6 +24,7 @@ MIN_AREA = 30        # ignore contours smaller than this (noise)
 PAD = 20             # padding around each character (same as the report)
 MAX_SIDE = 1600      # downscale huge photos to protect the 1 GB cloud memory limit
 MAX_CHARS = 200      # safety cap on number of contours processed
+DARK_BG_MEAN = 127   # [DARK-BACKGROUND FIX] mean intensity below this => dark background
 
 st.set_page_config(page_title="Handwritten Text Recognition", page_icon="✍️", layout="centered")
 
@@ -56,22 +57,40 @@ def load_gray(file) -> np.ndarray:
     return gray
 
 
+# --------------------------------------------- [DARK-BACKGROUND FIX] polarity check
+def ensure_dark_ink_on_light(gray: np.ndarray):
+    """
+    The pipeline below (THRESH_BINARY_INV + Otsu) assumes DARK ink on a LIGHT background.
+    For white chalk on a blackboard the polarity is reversed, so the background would be
+    segmented as the "character". If the average brightness is below DARK_BG_MEAN we invert
+    the image, which makes the background light and the ink dark again.
+    Returns (image_with_dark_ink, was_inverted).
+    """
+    if float(gray.mean()) < DARK_BG_MEAN:
+        return cv2.bitwise_not(gray), True
+    return gray, False
+
+
 # ------------------------------------------------------------ read_text
 def read_text(gray: np.ndarray, model):
     """
     Same workflow as the report: Otsu threshold -> external contours -> sort left to right
     -> square padded canvas -> 28x28 -> CNN. Returns text plus data for display.
+    Now background-agnostic: dark backgrounds are inverted BEFORE Otsu thresholding.
     """
-    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # [DARK-BACKGROUND FIX] polarity check runs first, Otsu runs on the corrected image.
+    ink_gray, inverted = ensure_dark_ink_on_light(gray)
+    _, th = cv2.threshold(ink_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     contours = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]  # OpenCV 3/4 safe
     boxes = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) > MIN_AREA]
     boxes = sorted(boxes, key=lambda b: b[0])     # left to right
     truncated = len(boxes) > MAX_CHARS
     boxes = boxes[:MAX_CHARS]
 
+    # Boxes are drawn on the ORIGINAL image so the user sees their own upload, not the inverted copy.
     annotated = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
     if not boxes:
-        return "", annotated, [], [], False
+        return "", annotated, [], [], False, inverted
 
     chars = []
     for x, y, w, h in boxes:
@@ -98,7 +117,7 @@ def read_text(gray: np.ndarray, model):
 
     rows = [{"#": n, "Character": CLASS_NAMES[i], "Confidence": f"{c * 100:.1f}%"}
             for n, (i, c) in enumerate(zip(idx, conf), start=1)]
-    return text, annotated, rows, chars, truncated
+    return text, annotated, rows, chars, truncated, inverted
 
 
 # --------------------------------------------------------------------- UI
@@ -142,12 +161,15 @@ except Exception:
     st.stop()
 
 with st.spinner("Reading handwriting..."):
-    text, annotated, rows, chars, truncated = read_text(gray, model)
+    text, annotated, rows, chars, truncated, inverted = read_text(gray, model)
 
 if not text:
     st.image(gray, caption="Uploaded image")
     st.warning("No characters were found. Use dark writing on a plain light background.")
     st.stop()
+
+if inverted:                                       # [DARK-BACKGROUND FIX] tell the user what happened
+    st.caption("Dark background detected: the image was inverted automatically before reading.")
 
 st.subheader("Recognised text")
 st.code(text, language=None)                       # built-in copy button
